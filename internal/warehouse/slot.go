@@ -30,6 +30,10 @@ type Calendar struct {
 	bookings map[string]Booking
 }
 
+type TransferValidator interface {
+	ApproveTransfer(context.Context, Booking, string) error
+}
+
 func New() *Calendar { return &Calendar{slots: map[string]Slot{}, bookings: map[string]Booking{}} }
 func (c *Calendar) Add(s Slot) error {
 	if s.ID == "" || s.Terminal == "" || s.MaxKg <= 0 || !s.CloseAt.After(s.OpenAt) {
@@ -82,6 +86,44 @@ func (c *Calendar) Cancel(id string) error {
 	s.UsedKg -= b.WeightKg
 	delete(c.bookings, id)
 	c.slots[b.SlotID] = s
+	return nil
+}
+
+func Transfer(ctx context.Context, source, destination *Calendar, bookingID, targetSlotID string, validator TransferValidator) error {
+	if source == nil || destination == nil || source == destination || bookingID == "" || targetSlotID == "" || validator == nil {
+		return domain.ErrInvalid
+	}
+	source.mu.Lock()
+	booking, ok := source.bookings[bookingID]
+	defer source.mu.Unlock()
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if err := validator.ApproveTransfer(ctx, booking, targetSlotID); err != nil {
+		return err
+	}
+	destination.mu.Lock()
+	defer destination.mu.Unlock()
+	target, ok := destination.slots[targetSlotID]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if booking.Start.Before(target.OpenAt) || booking.End.After(target.CloseAt) || target.UsedKg+booking.WeightKg > target.MaxKg {
+		return domain.ErrCapacity
+	}
+	for _, existing := range destination.bookings {
+		if existing.SlotID == targetSlotID && booking.Start.Before(existing.End) && existing.Start.Before(booking.End) {
+			return domain.ErrConflict
+		}
+	}
+	oldSlot := source.slots[booking.SlotID]
+	oldSlot.UsedKg -= booking.WeightKg
+	target.UsedKg += booking.WeightKg
+	delete(source.bookings, bookingID)
+	booking.SlotID = targetSlotID
+	destination.bookings[bookingID] = booking
+	source.slots[oldSlot.ID] = oldSlot
+	destination.slots[target.ID] = target
 	return nil
 }
 func (c *Calendar) Utilization(id string) (float64, error) {
